@@ -1,0 +1,492 @@
+import os, json, uuid, requests, re, subprocess
+from ddgs import DDGS
+from datetime import datetime
+from dotenv import load_dotenv
+from typing import AsyncGenerator
+from langchain_groq import ChatGroq
+from bs4 import BeautifulSoup
+import wikipediaapi
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+from pydantic import BaseModel
+from fpdf import FPDF
+import tempfile, chromadb
+from langchain_huggingface import HuggingFaceEmbeddings
+ 
+load_dotenv()
+ 
+chroma_client = chromadb.PersistentClient(path="./research_db")
+collection = chroma_client.get_or_create_collection(name="research_knowledge", metadata={"hnsw:space": "cosine"})
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={"device": "cpu"}, encode_kwargs={"normalize_embeddings": True}, cache_folder="./models")
+ 
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 80
+SIMILARITY_THRESHOLD = 1.4
+ 
+def _chunk_text(text):
+    chunks, start = [], 0
+    while start < len(text):
+        chunk = text[start:start + CHUNK_SIZE]
+        if chunk.strip(): chunks.append(chunk)
+        start += CHUNK_SIZE - CHUNK_OVERLAP
+    return chunks
+ 
+def save_to_vector_db(topic, content, session_id):
+    try:
+        chunks = _chunk_text(content)
+        docs, embeds, ids, metas = [], [], [], []
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip(): continue
+            docs.append(chunk)
+            embeds.append(embeddings.embed_query(chunk))
+            ids.append(f"{session_id}_{topic[:20].replace(' ','_')}_{i}_{uuid.uuid4().hex[:6]}")
+            metas.append({"topic": topic, "session_id": session_id, "timestamp": datetime.now().isoformat(), "chunk_index": i, "total_chunks": len(chunks)})
+        if docs: collection.add(documents=docs, embeddings=embeds, ids=ids, metadatas=metas)
+        print(f"RAG indexed: {len(docs)} chunks for '{topic}'")
+    except Exception as e:
+        print(f"RAG save error: {e}")
+ 
+def search_vector_db(query, n_results=5):
+    try:
+        total = collection.count()
+        if total == 0: return ""
+        q_emb = embeddings.embed_query(query)
+        results = collection.query(query_embeddings=[q_emb], n_results=min(n_results, total), include=["documents", "metadatas", "distances"])
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+        if not docs: return ""
+        filtered = [(d, m, dist) for d, m, dist in zip(docs, metas, distances) if dist <= SIMILARITY_THRESHOLD]
+        if not filtered: return ""
+        seen, unique = set(), []
+        for d, m, dist in filtered:
+            if d[:80] not in seen:
+                seen.add(d[:80])
+                unique.append((d, m, dist))
+        parts = []
+        for rank, (d, m, dist) in enumerate(unique, 1):
+            relevance = round((1 - dist) * 100, 1)
+            parts.append(f"[RAG-{rank}] Topic: {m.get('topic','?')} | Date: {m.get('timestamp','')[:10]} | Relevance: {relevance}%\n{d}")
+        return "\n\n".join(parts)
+    except Exception as e:
+        print(f"RAG search error: {e}")
+        return ""
+ 
+print("Vector DB ready!")
+ 
+BLOCKED_DOMAINS = ["imgflip.com","imgur.com","giphy.com","9gag.com","pinterest.com","tumblr.com","tiktok.com","youtube.com","youtu.be","facebook.com","instagram.com","twitter.com","x.com","snapchat.com","reddit.com","amazon.com","ebay.com","etsy.com","translate.google","accounts.google","maps.google","play.google","buzzfeed.com","boredpanda.com"]
+TRUSTED_DOMAINS = ["reuters.com","apnews.com","bbc.com","bbc.co.uk","theguardian.com","nytimes.com","washingtonpost.com","bloomberg.com","forbes.com","economist.com","aljazeera.com","cnn.com","npr.org","arxiv.org","researchgate.net","pubmed.ncbi.nlm.nih.gov","nature.com","science.org","springer.com","ieee.org","who.int","un.org","worldbank.org","nih.gov","nasa.gov","github.com","techcrunch.com","wired.com","arstechnica.com","wikipedia.org","britannica.com","dawn.com","geo.tv","thenews.com.pk"]
+ 
+def is_blocked(url): return any(d in url.lower() for d in BLOCKED_DOMAINS)
+def is_trusted(url): return any(d in url.lower() for d in TRUSTED_DOMAINS)
+def filter_results(results): return [r for r in results if not is_blocked(r.get("href", r.get("url", "")))]
+ 
+URL_PATTERN = re.compile(r'https?://[^\s\)\]\>\"\'<]+')
+def clean_url(url): return url.rstrip('.,;:!?)>]"\'')
+def extract_urls_from_text(text):
+    urls, seen = [], set()
+    for raw in URL_PATTERN.findall(text):
+        url = clean_url(raw)
+        if url and url not in seen and not is_blocked(url):
+            seen.add(url)
+            urls.append({"url": url, "trusted": is_trusted(url)})
+    return urls
+ 
+def tool_web_search(query):
+    try:
+        with DDGS() as ddgs: raw = list(ddgs.text(query, max_results=10))
+        results = filter_results(raw)[:6]
+        if not results: return "No results found."
+        return "\n\n".join([f"[{i}] {r.get('title','')}\nURL: {r.get('href','')}\nContent: {r.get('body','')[:600]}" for i, r in enumerate(results, 1)])
+    except Exception as e: return f"Search error: {str(e)}"
+ 
+def tool_news_search(query):
+    try:
+        with DDGS() as ddgs: raw = list(ddgs.news(query, max_results=10))
+        results = filter_results(raw)[:6]
+        if not results: return "No news found."
+        return "\n\n".join([f"[{i}] {r.get('title','')}\nSource: {r.get('source','')}\nDate: {r.get('date','')}\nURL: {r.get('url', r.get('href',''))}\nSummary: {r.get('body','')[:500]}" for i, r in enumerate(results, 1)])
+    except Exception as e: return f"News error: {str(e)}"
+ 
+def tool_deep_search(query):
+    try:
+        with DDGS() as ddgs: trusted = list(ddgs.text(f"{query} site:reuters.com OR site:bloomberg.com OR site:bbc.com OR site:forbes.com", max_results=5))
+        with DDGS() as ddgs: general = list(ddgs.text(query, max_results=8))
+        all_r = filter_results(trusted + general)
+        all_r.sort(key=lambda r: (1 if is_trusted(r.get("href","")) else 0), reverse=True)
+        results = all_r[:6]
+        if not results: return "No results found."
+        return "\n\n".join([f"[{i}] {'TRUSTED ' if is_trusted(r.get('href','')) else ''}{r.get('title','')}\nURL: {r.get('href','')}\nContent: {r.get('body','')[:600]}" for i, r in enumerate(results, 1)])
+    except Exception as e: return f"Deep search error: {str(e)}"
+ 
+def tool_scrape_url(url):
+    if is_blocked(url): return "Blocked URL — skipping."
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        response = requests.get(url, headers=headers, timeout=12)
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup(["script","style","nav","footer","header","aside","iframe"]): tag.decompose()
+        main = soup.find("article") or soup.find("main") or soup.find("div", class_=re.compile(r"content|article|post|body", re.I)) or soup.find("body")
+        text = main.get_text(separator="\n", strip=True) if main else soup.get_text(separator="\n", strip=True)
+        lines = [l.strip() for l in text.split("\n") if l.strip() and len(l.strip()) > 30]
+        body = "\n".join(lines)
+        body = (body[:4000] + "...") if len(body) > 4000 else body
+        return f"[1] Scraped Article\nURL: {url}\nContent: {body}"
+    except Exception as e: return f"Scraping error: {str(e)}"
+ 
+def tool_wikipedia_search(topic):
+    try:
+        wiki = wikipediaapi.Wikipedia(language="en", user_agent="ResearchAgent/6.0")
+        page = wiki.page(topic)
+        if not page.exists(): page = wiki.page(topic.split()[0])
+        if not page.exists(): return f"Wikipedia page not found for: {topic}"
+        return f"Wikipedia: {page.title}\nURL: {page.fullurl}\n\n{page.summary[:2500]}"
+    except Exception as e: return f"Wikipedia error: {str(e)}"
+ 
+def tool_academic_search(query):
+    try:
+        with DDGS() as ddgs: raw = list(ddgs.text(f"{query} research paper site:arxiv.org OR site:researchgate.net OR site:pubmed.ncbi.nlm.nih.gov OR site:nature.com OR site:ieee.org", max_results=8))
+        results = filter_results(raw)[:5]
+        if not results: return "No academic results found."
+        return "\n\n".join([f"[{i}] {r.get('title','')}\nURL: {r.get('href','')}\nAbstract: {r.get('body','')[:500]}" for i, r in enumerate(results, 1)])
+    except Exception as e: return f"Academic search error: {str(e)}" 
+ 
+def tool_search_cached_research(query):
+    result = search_vector_db(query, n_results=5)
+    return "Found cached research (RAG):\n\n" + result if result else "No cached research found."
+ 
+TOOLS = {"web_search": tool_web_search, "news_search": tool_news_search, "deep_search": tool_deep_search, "scrape_url": tool_scrape_url, "wikipedia_search": tool_wikipedia_search, "academic_search": tool_academic_search, "search_cached_research": tool_search_cached_research}
+ 
+TOOL_DESCRIPTIONS = {"web_search": "Search the web for current information, facts, and data", "news_search": "Search latest news and current events with dates", "deep_search": "Deep search prioritizing trusted sources (Reuters, Bloomberg, BBC)", "scrape_url": "Read full content from a specific URL. argument must be a full URL", "wikipedia_search": "Search Wikipedia for background, history, definitions", "academic_search": "Search academic papers from arxiv, pubmed, nature, ieee", "search_cached_research": "Search previously researched topics from local RAG vector database"}
+ 
+TOOL_FRIENDLY = {"web_search": "🌐 Web Search", "news_search": "📰 News Search", "deep_search": "🔬 Deep Search", "scrape_url": "📄 Reading Article", "wikipedia_search": "📚 Wikipedia", "academic_search": "🎓 Academic Search", "search_cached_research": "⚡ RAG Cache"}
+ 
+llm_selector = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.getenv("GROQ_API_KEY"), streaming=False, temperature=0, max_tokens=300)
+llm_writer = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.getenv("GROQ_API_KEY"), streaming=True, temperature=0.3, max_tokens=8192)
+today = datetime.now().strftime("%Y-%m-%d")
+ 
+def make_selector_prompt(user_query, active_tool_names, research_so_far, iteration, min_iterations, rag_context):
+    tools_list = "\n".join([f"  - {name}: {TOOL_DESCRIPTIONS[name]}" for name in active_tool_names])
+    used_args = [r["argument"] for r in research_so_far]
+    history = ""
+    if research_so_far:
+        history = "Already searched:\n" + "\n".join([f"  [{i+1}] {r['tool']}({r['argument'][:60]})" for i, r in enumerate(research_so_far)])
+    rag_hint = f"\nRAG Cache:\n{rag_context[:600]}\n" if rag_context else ""
+    done_hint = '\nEnough data. You CAN return {"tool": "DONE"}.' if iteration >= min_iterations else ""
+    return f"""You are a research planner. Today: {today}
+Research topic: "{user_query}"
+ 
+Available tools:
+{tools_list}
+{rag_hint}
+{history}
+{done_hint}
+ 
+Return ONLY JSON:
+{{"tool": "tool_name", "argument": "search query or URL"}}
+ 
+SEARCH STRATEGY RULES:
+- If user asks about "websites/companies/apps using X technology":
+  * Search: "companies that use X in production"
+  * Search: "X users examples real applications stackshare"
+  * Search: "who uses X technology examples"
+  * Scrape: https://stackshare.io/expressjs (for Express.js users list)
+  * Scrape: https://stackshare.io/[technology] (real company list)
+  * NEVER search documentation or tutorials
+- For general topics: use diverse queries from different angles
+- Do NOT repeat: {used_args}
+- search_cached_research first if not done yet"""
+ 
+def call_selector(prompt):
+    try:
+        resp = llm_selector.invoke([
+            {"role": "system", "content": "Return ONLY valid JSON. No explanation. No markdown."},
+            {"role": "user", "content": prompt},
+        ])
+        raw = resp.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+    except Exception as e:
+        err = str(e)
+        print(f"Selector error: {err[:100]}")
+        if "429" in err or "rate_limit" in err:
+            print("Rate limit — stopping loop")
+            return {"tool": "DONE"}
+        return {"tool": "web_search", "argument": f"{today} research"}
+ 
+async def run_research_loop(user_query, active_tool_names, min_iterations, max_iterations):
+    research_so_far = []
+    collected_sources = []
+    seen_urls = set()
+    rag_context = search_vector_db(user_query, n_results=5)
+    rag_hit = bool(rag_context)
+    yield {"type": "step", "data": f"{'⚡ RAG: Found prior knowledge!' if rag_hit else '📭 RAG: No cache — fresh research'}"}
+    if "search_cached_research" in active_tool_names:
+        yield {"type": "step", "data": "⚡ RAG Cache: Checking vector DB..."}
+        result = tool_search_cached_research(user_query)
+        research_so_far.append({"tool": "search_cached_research", "argument": user_query, "result": result})
+        added = 0
+        for u in extract_urls_from_text(result):
+            if u["url"] not in seen_urls:
+                seen_urls.add(u["url"]); u["tool"] = "search_cached_research"; collected_sources.append(u); added += 1
+        yield {"type": "step", "data": f"✅ RAG Cache done (+{added} URLs)"}
+    for iteration in range(1, max_iterations + 1):
+        prompt = make_selector_prompt(user_query, active_tool_names, research_so_far, iteration, min_iterations, rag_context)
+        decision = call_selector(prompt)
+        tool_name = decision.get("tool", "web_search")
+        argument = decision.get("argument", user_query)
+        if tool_name == "DONE":
+            yield {"type": "step", "data": "✍️ Research complete — writing report..."}
+            break
+        if tool_name not in TOOLS:
+            print(f"Unknown tool: {tool_name}"); continue
+        friendly = TOOL_FRIENDLY.get(tool_name, tool_name)
+        yield {"type": "step", "data": f"{friendly}: {str(argument)[:60]}"}
+        result = TOOLS[tool_name](argument)
+        research_so_far.append({"tool": tool_name, "argument": argument, "result": result})
+        added = 0
+        for u in extract_urls_from_text(result):
+            if u["url"] not in seen_urls:
+                seen_urls.add(u["url"]); u["tool"] = tool_name; collected_sources.append(u); added += 1
+        yield {"type": "step", "data": f"✅ {friendly} done (+{added} URLs)"}
+        if iteration >= max_iterations:
+            yield {"type": "step", "data": "✍️ Max iterations — writing report..."}
+            break
+    yield {"type": "research_done", "data": {"research_so_far": research_so_far, "collected_sources": collected_sources, "rag_context": rag_context, "rag_hit": rag_hit}}
+ 
+WRITER_SYSTEM = f"""You are a professional research report writer. Today: {today}
+ 
+LANGUAGE: Write ENTIRE report in ENGLISH only.
+ 
+CRITICAL CONTENT RULES:
+1. Answer the user's EXACT question directly
+2. If user asks for "websites using X", "companies using X", "apps built with X" — list REAL company websites (like netflix.com, uber.com, linkedin.com) found in research data — NOT documentation pages or tutorials
+3. Use ONLY URLs from the research data — NEVER invent or hallucinate URLs
+4. Copy every URL exactly as it appears in research data — never modify
+5. Use specific facts, numbers, dates from research — no generic filler
+6. Stay focused on exactly what was asked
+ 
+REPORT FORMAT:
+# Research Report: [Exact Topic]
+*Generated: {today} | Sources analyzed: [count]*
+ 
+## Executive Summary
+[Direct answer to the question in 4-5 sentences with key facts]
+ 
+## Background & Context
+[Relevant history and context with dates]
+ 
+## Key Findings
+### Finding 1: [Title]
+[Specific data, numbers, real examples from research]
+ 
+### Finding 2: [Title]
+[Specific data, numbers, real examples from research]
+ 
+### Finding 3: [Title]
+[Specific data, numbers, real examples from research]
+ 
+## Latest Developments ({today[:4]})
+[Recent news with exact dates from research data]
+ 
+## Expert & Academic Insights
+[Scholarly perspectives with citations]
+ 
+## Critical Analysis
+[Deep analysis, trends, implications]
+ 
+## Future Outlook
+[Evidence-based predictions]
+ 
+## Conclusion
+[8-10 specific bullet point takeaways directly answering the query]
+ 
+## Sources & References
+[Copy EVERY URL from MANDATORY SOURCES exactly]
+1. [Title] — https://url
+2. [Title] — https://url
+ 
+ABSOLUTE RULES:
+- Minimum 1200 words
+- NEVER invent URLs — only use URLs given in research data
+- NEVER use localhost or placeholder URLs
+- Answer the EXACT question asked"""
+ 
+def build_writer_prompt(user_query, research_so_far, collected_sources, rag_context):
+    sources_block = "\n".join([f"[{i+1}] {s['url']}" for i, s in enumerate(collected_sources)]) or "(No external URLs collected)"
+    research_block = "\n\n".join([f"=== {r['tool'].upper()}({r['argument'][:80]}) ===\n{r['result'][:1500]}" for r in research_so_far])
+    rag_section = f"\n=== RAG VECTOR DB — PRIOR KNOWLEDGE ===\n{rag_context}\n" if rag_context else ""
+    return (
+        f"USER QUESTION: {user_query}\n\n"
+        f"IMPORTANT: Answer this EXACT question. If user asked for websites/companies/apps using a technology, "
+        f"list real ones found in research data below — NOT documentation links.\n\n"
+        f"=== RESEARCH DATA ===\n{research_block}\n"
+        f"{rag_section}"
+        f"=== MANDATORY SOURCES — COPY ALL URLs EXACTLY ===\n{sources_block}\n\n"
+        f"Now write the complete research report answering: \"{user_query}\""
+    )
+ 
+sessions = {}
+ 
+def get_session(session_id):
+    if session_id not in sessions:
+        sessions[session_id] = {"id": session_id, "created_at": datetime.now().isoformat(), "messages": [], "research_history": [], "research_count": 0}
+    return sessions[session_id]
+ 
+def generate_pdf(topic, content):
+    pdf = FPDF()
+    pdf.set_margins(15, 15, 15)
+    pdf.add_page()
+    ew = pdf.w - pdf.l_margin - pdf.r_margin
+    pdf.set_font("Helvetica", "B", 18); pdf.multi_cell(ew, 12, "Professional Research Report", align="C")
+    pdf.set_font("Helvetica", "B", 13); pdf.multi_cell(ew, 9, f"Topic: {topic[:60]}", align="C")
+    pdf.set_font("Helvetica", "", 10); pdf.multi_cell(ew, 7, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", align="C")
+    pdf.ln(8); pdf.set_font("Helvetica", "", 11)
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line: pdf.ln(3); continue
+        try:
+            s = line.encode('latin-1', 'replace').decode('latin-1')
+            if line.startswith("default# "): pdf.set_font("Helvetica", "B", 15); pdf.multi_cell(ew, 9, s[2:]); pdf.set_font("Helvetica", "", 11)
+            elif line.startswith("## "): pdf.ln(2); pdf.set_font("Helvetica", "B", 13); pdf.multi_cell(ew, 8, s[3:]); pdf.set_font("Helvetica", "", 11)
+            elif line.startswith("### "): pdf.set_font("Helvetica", "B", 12); pdf.multi_cell(ew, 8, s[4:]); pdf.set_font("Helvetica", "", 11)
+            elif line.startswith(("- ", "* ")): pdf.multi_cell(ew, 7, f"  . {s[2:]}")
+            else: pdf.multi_cell(ew, 7, s)
+        except: pdf.ln(2)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf.output(tmp.name)
+    return tmp.name
+ 
+app = FastAPI(title="Research Agent v6.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+ 
+class ResearchRequest(BaseModel):
+    message: str
+    session_id: str = ""
+    allowed_tools: list = []
+ 
+class PDFRequest(BaseModel):
+    topic: str
+    content: str
+ 
+class KnowledgeRequest(BaseModel):
+    text: str
+    topic: str
+    session_id: str = "manual"
+ 
+async def stream_research(message, session_id, allowed_tools):
+    session = get_session(session_id)
+    session["research_count"] += 1
+    active_tool_names = [t for t in allowed_tools if t in TOOLS] if allowed_tools else list(TOOLS.keys())
+    if not active_tool_names: active_tool_names = list(TOOLS.keys())
+    num_tools = len(active_tool_names)
+    # ✅ FIX: iterations kam kiye — rate limit nahi aayega
+    min_iter = 3
+    max_iter = 5
+    tool_display = " | ".join([TOOL_FRIENDLY.get(t, t) for t in active_tool_names])
+    yield f"data: {json.dumps({'step': '🧠 Analyzing query...'})}\n\n"
+    yield f"data: {json.dumps({'step': f'🛠 Tools ({num_tools}): {tool_display}'})}\n\n"
+    research_data = None
+    async for event in run_research_loop(message, active_tool_names, min_iter, max_iter):
+        if event["type"] == "step": yield f"data: {json.dumps({'step': event['data']})}\n\n"
+        elif event["type"] == "research_done": research_data = event["data"]
+    if not research_data:
+        yield f"data: {json.dumps({'step': '❌ Research loop failed'})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    research_so_far = research_data["research_so_far"]
+    collected_sources = research_data["collected_sources"]
+    rag_context = research_data["rag_context"]
+    rag_hit = research_data["rag_hit"]
+    writer_prompt = build_writer_prompt(message, research_so_far, collected_sources, rag_context)
+    yield f"data: {json.dumps({'step': f'✍️ Writing report ({len(research_so_far)} searches, {len(collected_sources)} URLs)...'})}\n\n"
+    yield f"data: {json.dumps({'step': '---REPORT_START---'})}\n\n"
+    full_response = ""
+    try:
+        for chunk in llm_writer.stream([{"role": "system", "content": WRITER_SYSTEM}, {"role": "user", "content": writer_prompt}]):
+            token = chunk.content
+            full_response += token
+            yield f"data: {json.dumps({'token': token})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'step': f'❌ Writer error: {str(e)[:100]}'})}\n\n"
+    if full_response and collected_sources:
+        in_report = set(clean_url(u) for u in URL_PATTERN.findall(full_response))
+        missing = [s for s in collected_sources if s["url"] not in in_report]
+        if missing:
+            block = "\n\n## Additional Sources\n" + "\n".join([f"{i+1}. {s['url']}" for i, s in enumerate(missing)])
+            full_response += block
+            for char in block: yield f"data: {json.dumps({'token': char})}\n\n"
+    yield f"data: {json.dumps({'sources': collected_sources})}\n\n"
+    if full_response:
+        save_to_vector_db(message, full_response, session_id)
+        yield f"data: {json.dumps({'step': '💾 RAG: Research indexed in Vector DB!'})}\n\n"
+    session["messages"].append({"role": "user", "content": message})
+    session["messages"].append({"role": "assistant", "content": full_response})
+    session["research_history"].append({"query": message, "report": full_response, "searches": len(research_so_far), "sources": collected_sources, "tools_used": active_tool_names, "rag_hit": rag_hit, "timestamp": datetime.now().isoformat()})
+    yield f"data: {json.dumps({'stats': {'searches': len(research_so_far), 'words': len(full_response.split()), 'urls': len(collected_sources), 'rag_hit': rag_hit, 'tools': num_tools}})}\n\n"
+    yield "data: [DONE]\n\n"
+ 
+@app.post("/research/stream")
+async def research_stream(request: ResearchRequest):
+    return StreamingResponse(stream_research(request.message, request.session_id, request.allowed_tools), media_type="text/event-stream")
+ 
+@app.post("/export/pdf")
+async def export_pdf(request: PDFRequest):
+    pdf_path = generate_pdf(request.topic, request.content)
+    return FileResponse(pdf_path, media_type="application/pdf", filename=f"research_{request.topic[:30].replace(' ', '_')}.pdf")
+ 
+@app.get("/sessions")
+async def get_all_sessions(): return list(sessions.values())
+ 
+@app.get("/sessions/{session_id}")
+async def get_session_info(session_id: str): return get_session(session_id)
+ 
+@app.get("/sessions/{session_id}/history")
+async def get_research_history(session_id: str): return get_session(session_id)["research_history"]
+ 
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    sessions.pop(session_id, None)
+    return {"message": "Deleted"}
+ 
+@app.get("/vector-db/stats")
+async def vector_db_stats(): return {"total_chunks": collection.count(), "status": "active", "chunk_size": CHUNK_SIZE, "chunk_overlap": CHUNK_OVERLAP, "similarity_threshold": SIMILARITY_THRESHOLD, "embedding_model": "all-MiniLM-L6-v2", "distance_metric": "cosine"}
+ 
+@app.post("/vector-db/add")
+async def add_knowledge(request: KnowledgeRequest):
+    save_to_vector_db(request.topic, request.text, request.session_id)
+    return {"message": f"RAG indexed: {request.topic}"}
+ 
+@app.post("/vector-db/search")
+async def search_knowledge(request: KnowledgeRequest):
+    result = search_vector_db(request.text, n_results=5)
+    return {"query": request.text, "results": result or "No results found"}
+ 
+@app.delete("/vector-db/clear")
+async def clear_vector_db():
+    global collection
+    chroma_client.delete_collection("research_knowledge")
+    collection = chroma_client.get_or_create_collection(name="research_knowledge", metadata={"hnsw:space": "cosine"})
+    return {"message": "Vector DB cleared!"}
+ 
+@app.get("/health")
+async def health_check(): 
+    return {"status": "healthy", "version": "6.0", "model": "llama-3.3-70b-versatile", "architecture": "manual-tool-calling", "tool_errors_possible": False, "vector_db_chunks": collection.count(), "active_sessions": len(sessions), "timestamp": datetime.now().isoformat()}
+ 
+@app.get("/tools")
+async def get_tools(): 
+    return {"tools": [{"name": name, "description": desc} for name, desc in TOOL_DESCRIPTIONS.items()]}
+ 
+@app.get("/")
+async def root(): 
+    return {"name": "Research Agent v6.0", "architecture": "Groq = writer only | Tools = pure Python | Tool errors = impossible", "rag": "ChromaDB + all-MiniLM-L6-v2 cosine similarity", "status": "running"}
+ 
+if __name__ == "__main__":
+    import uvicorn
+    try:
+        subprocess.run('for /f "tokens=5" %a in (\'netstat -ano ^| findstr :8001\') do taskkill /PID %a /F', shell=True, capture_output=True)
+    except: pass
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+    

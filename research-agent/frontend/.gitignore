@@ -1,0 +1,1515 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# production
+/build
+
+# misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+/* eslint-disable */
+import { useState, useRef, useEffect } from "react";
+import "./App.css";
+
+const API_URL = "http://localhost:8001";
+
+const ALL_TOOLS = [
+  { id: "web_search",            label: "🌐 Web",      desc: "General web search" },
+  { id: "news_search",           label: "📰 News",     desc: "Latest news articles" },
+  { id: "deep_search",           label: "🔬 Deep",     desc: "Comprehensive deep search" },
+  { id: "wikipedia_search",      label: "📚 Wiki",     desc: "Wikipedia background info" },
+  { id: "academic_search",       label: "🎓 Academic", desc: "Scholarly & research papers" },
+  { id: "scrape_url",            label: "📄 Scrape",   desc: "Read full article content" },
+  { id: "search_cached_research",label: "⚡ Cache",    desc: "Previously cached research" },
+];
+
+export default function App() {
+  const [query, setQuery] = useState("");
+  const [isResearching, setIsResearching] = useState(false);
+  const [steps, setSteps] = useState([]);
+  const [report, setReport] = useState("");
+  const [stats, setStats] = useState(null);
+  const [sources, setSources] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [selectedTools, setSelectedTools] = useState(ALL_TOOLS.map(t => t.id));
+  const [showToolPicker, setShowToolPicker] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [pdfFolder, setPdfFolder] = useState([]);
+  const [showPdfFolder, setShowPdfFolder] = useState(false);
+  const [currentTopic, setCurrentTopic] = useState("");
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const reportRef = useRef(null);
+  const inputRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const SESSION_ID = "user1";
+
+  useEffect(() => {
+    if (reportRef.current) {
+      reportRef.current.scrollTop = reportRef.current.scrollHeight;
+    }
+  }, [report]);
+
+  // Voice recognition setup
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const rec = new SpeechRecognition();
+      rec.continuous = false;
+      rec.interimResults = true;
+      rec.lang = "en-US";
+      rec.onresult = (e) => {
+        const transcript = Array.from(e.results)
+          .map(r => r[0].transcript)
+          .join("");
+        setQuery(transcript);
+      };
+      rec.onend = () => setIsListening(false);
+      rec.onerror = () => setIsListening(false);
+      recognitionRef.current = rec;
+    }
+  }, []);
+
+  const toggleVoice = () => {
+    if (!recognitionRef.current) {
+      alert("Voice recognition is not supported in this browser. Please use Chrome.");
+      return;
+    }
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    } else {
+      recognitionRef.current.start();
+      setIsListening(true);
+    }
+  };
+
+  const toggleTool = (id) => {
+    setSelectedTools(prev =>
+      prev.includes(id)
+        ? prev.length > 1 ? prev.filter(t => t !== id) : prev
+        : [...prev, id]
+    );
+  };
+
+  const selectAllTools = () => setSelectedTools(ALL_TOOLS.map(t => t.id));
+  const clearTools = () => setSelectedTools([ALL_TOOLS[0].id]);
+
+  // ✅ FILE UPLOAD
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const allowedTypes = ["pdf", "txt", "docx", "md"];
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (!allowedTypes.includes(ext)) {
+      alert("Only PDF, TXT, DOCX, MD files are supported!");
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      alert("File too large! Max 10MB allowed.");
+      return;
+    }
+
+    setIsUploading(true);
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await fetch(`${API_URL}/upload/parse`, {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        setUploadedFile({
+          name: data.filename,
+          text: data.text,
+          chars: data.chars,
+          size: file.size,
+        });
+      } else {
+        alert("File parse failed: " + (data.error || "Unknown error"));
+      }
+    } catch (err) {
+      alert("Upload failed! Backend chalu hai?");
+    }
+
+    setIsUploading(false);
+    e.target.value = "";
+  };
+
+  const removeUploadedFile = () => {
+    setUploadedFile(null);
+  };
+
+  // ✅ NEW CHAT
+  const startNewChat = () => {
+    setReport("");
+    setSteps([]);
+    setStats(null);
+    setSources([]);
+    setQuery("");
+    setCurrentTopic("");
+    setIsResearching(false);
+    setShowToolPicker(false);
+    setUploadedFile(null);
+  };
+
+  const startResearch = async (q) => {
+    const question = q || query;
+    if (!question.trim() || isResearching) return;
+    const currentQuery = question.trim();
+    setCurrentTopic(currentQuery);
+    setQuery("");
+    setIsResearching(true);
+    setSteps([]);
+    setReport("");
+    setStats(null);
+    setSources([]);
+    setShowToolPicker(false);
+
+    // Build message with tool restrictions and file content
+    let enhancedMessage = currentQuery;
+
+    if (uploadedFile) {
+      enhancedMessage = `${currentQuery}\n\n[ATTACHED FILE: ${uploadedFile.name}]\n${uploadedFile.text}\n[END OF FILE]`;
+    }
+
+    if (selectedTools.length < ALL_TOOLS.length) {
+      const toolNames = selectedTools.join(", ");
+      enhancedMessage += `\n\n[TOOLS TO USE: ${toolNames} only]`;
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/research/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: enhancedMessage, session_id: SESSION_ID }),
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullReport = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const lines = decoder.decode(value).split("\n");
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6);
+          if (data === "[DONE]") break;
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.step && parsed.step !== "---REPORT_START---") {
+              setSteps(prev => [...prev, parsed.step]);
+            }
+            if (parsed.token) {
+              fullReport += parsed.token;
+              setReport(fullReport);
+            }
+            if (parsed.stats) {
+              setStats(parsed.stats);
+              setHistory(prev => [{
+                query: currentQuery,
+                report: fullReport,
+                stats: parsed.stats,
+                timestamp: new Date().toLocaleString(),
+              }, ...prev]);
+            }
+            if (parsed.sources) {
+              setSources(parsed.sources);
+            }
+          } catch {}
+        }
+      }
+    } catch (err) {
+      setSteps(prev => [...prev, "❌ Connection error — backend chalu hai?"]);
+    }
+    setIsResearching(false);
+  };
+
+  const exportPDF = async (topicOverride, reportOverride) => {
+    const topic = topicOverride || currentTopic || "Research Report";
+    const content = reportOverride || report;
+    try {
+      const res = await fetch(`${API_URL}/export/pdf`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic, content }),
+      });
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `research_${topic.slice(0, 30).replace(/\s+/g, "_")}.pdf`;
+      a.click();
+    } catch { alert("PDF export failed!"); }
+  };
+
+  const addToPdfFolder = () => {
+    if (!report) return;
+    const exists = pdfFolder.find(p => p.topic === currentTopic);
+    if (exists) {
+      alert("This report is already in your PDF folder!");
+      return;
+    }
+    setPdfFolder(prev => [...prev, {
+      topic: currentTopic,
+      report,
+      addedAt: new Date().toLocaleString(),
+      words: report.split(" ").length,
+    }]);
+    const btn = document.getElementById("add-to-folder-btn");
+    if (btn) {
+      btn.textContent = "✅ Added!";
+      setTimeout(() => { btn.textContent = "📁 Add to Folder"; }, 1500);
+    }
+  };
+
+  const removeFromFolder = (topic) => {
+    setPdfFolder(prev => prev.filter(p => p.topic !== topic));
+  };
+
+  const exportAllFromFolder = async () => {
+    for (const item of pdfFolder) {
+      await exportPDF(item.topic, item.report);
+      await new Promise(r => setTimeout(r, 500));
+    }
+  };
+
+  const copyReport = () => {
+    navigator.clipboard.writeText(report);
+  };
+
+  const renderReport = (text) => {
+    return text.split("\n").map((line, i) => {
+      if (line.startsWith("# ")) return <h1 key={i} className="r-h1">{line.slice(2)}</h1>;
+      if (line.startsWith("## ")) return <h2 key={i} className="r-h2">{line.slice(3)}</h2>;
+      if (line.startsWith("### ")) return <h3 key={i} className="r-h3">{line.slice(4)}</h3>;
+      if (line.startsWith("- ") || line.startsWith("* ")) return <div key={i} className="r-li">• {line.slice(2)}</div>;
+      if (line.match(/^\d+\.\s/)) return <div key={i} className="r-li">{line}</div>;
+      if (line.trim() === "") return <br key={i} />;
+      if (line.includes("https://") || line.includes("http://")) {
+        const urlRegex = /(https?:\/\/[^\s]+)/g;
+        const parts = line.split(urlRegex);
+        return <p key={i} className="r-p">{parts.map((part, j) =>
+          part.match(urlRegex) ? <a key={j} href={part} target="_blank" rel="noreferrer" className="r-link">{part}</a> : part
+        )}</p>;
+      }
+      return <p key={i} className="r-p">{line}</p>;
+    });
+  };
+
+  const suggestions = [
+    "Latest AI developments 2025",
+    "Climate change impact on economy",
+    "Quantum computing breakthroughs",
+    "Future of renewable energy",
+  ];
+
+  const activeToolCount = selectedTools.length;
+
+  return (
+    <div className="app">
+      <div className="main">
+        {/* Hidden file input */}
+        <input
+          type="file"
+          ref={fileInputRef}
+          onChange={handleFileUpload}
+          accept=".pdf,.txt,.docx,.md"
+          style={{ display: "none" }}
+        />
+
+        {/* Top Bar */}
+        <div className="topbar">
+          <div className="topbar-logo">
+            <span className="logo-icon">⬡</span>
+            <span className="logo-text">ResearchAI</span>
+          </div>
+          <div className="topbar-right">
+            <div className="topbar-badge">v4.0 · 7 Tools · LLaMA 70B</div>
+            <button
+              className={`folder-btn ${pdfFolder.length > 0 ? "has-items" : ""}`}
+              onClick={() => setShowPdfFolder(true)}
+              title="PDF Folder"
+            >
+              📁
+              {pdfFolder.length > 0 && (
+                <span className="folder-badge">{pdfFolder.length}</span>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* PDF Folder Modal */}
+        {showPdfFolder && (
+          <div className="modal-overlay" onClick={() => setShowPdfFolder(false)}>
+            <div className="modal-box" onClick={e => e.stopPropagation()}>
+              <div className="modal-header">
+                <span>📁 PDF Folder</span>
+                <button className="modal-close" onClick={() => setShowPdfFolder(false)}>✕</button>
+              </div>
+              {pdfFolder.length === 0 ? (
+                <div className="modal-empty">
+                  <p>No reports saved yet.</p>
+                  <p className="modal-empty-sub">Research karo aur "Add to Folder" dabao.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="folder-items">
+                    {pdfFolder.map((item, i) => (
+                      <div key={i} className="folder-item">
+                        <div className="folder-item-info">
+                          <span className="folder-item-topic">{item.topic.slice(0, 45)}{item.topic.length > 45 ? "..." : ""}</span>
+                          <span className="folder-item-meta">{item.words} words · {item.addedAt}</span>
+                        </div>
+                        <div className="folder-item-actions">
+                          <button className="fi-btn download" onClick={() => exportPDF(item.topic, item.report)} title="Download PDF">⬇</button>
+                          <button className="fi-btn remove" onClick={() => removeFromFolder(item.topic)} title="Remove">✕</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="modal-footer">
+                    <button className="modal-export-all" onClick={exportAllFromFolder}>
+                      ⬇ Download All ({pdfFolder.length}) PDFs
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Hero or Research View */}
+        {!report && !isResearching ? (
+          <div className="hero">
+            <div className="hero-content">
+              <div className="hero-icon">⬡</div>
+              <h1 className="hero-title">What do you want to research?</h1>
+              <p className="hero-sub">Industry-grade AI research — powered by 7 search tools</p>
+
+              <div className="main-search">
+                <input
+                  ref={inputRef}
+                  className="main-input"
+                  placeholder="Ask anything..."
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && startResearch()}
+                />
+                <button
+                  className={`voice-btn ${isListening ? "listening" : ""}`}
+                  onClick={toggleVoice}
+                  title={isListening ? "Stop listening" : "Voice input"}
+                >
+                  {isListening ? "🔴" : "🎙️"}
+                </button>
+                <button className="main-btn" onClick={() => startResearch()}>
+                  <span>Research</span>
+                  <span className="btn-arrow">↗</span>
+                </button>
+              </div>
+
+              {isListening && (
+                <div className="voice-indicator">
+                  <span className="voice-pulse" />
+                  <span>Listening... bol do apna topic</span>
+                </div>
+              )}
+
+              {/* ✅ FILE UPLOAD UI */}
+              <div className="file-upload-wrap">
+                {!uploadedFile ? (
+                  <button
+                    className="file-upload-btn"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isUploading}
+                  >
+                    {isUploading ? "⏳ Uploading..." : "📎 Attach File (PDF / DOCX / TXT)"}
+                  </button>
+                ) : (
+                  <div className="file-attached">
+                    <span className="file-icon">📄</span>
+                    <div className="file-info">
+                      <span className="file-name">{uploadedFile.name}</span>
+                      <span className="file-meta">
+                        {(uploadedFile.size / 1024).toFixed(1)} KB · {uploadedFile.chars} chars extracted
+                      </span>
+                    </div>
+                    <button className="file-remove" onClick={removeUploadedFile} title="Remove file">✕</button>
+                  </div>
+                )}
+              </div>
+
+              {/* Tool Selector */}
+              <div className="tool-selector-wrap">
+                <button
+                  className="tool-selector-toggle"
+                  onClick={() => setShowToolPicker(p => !p)}
+                >
+                  🛠 Tools ({activeToolCount}/{ALL_TOOLS.length} selected)
+                  <span className="ts-arrow">{showToolPicker ? "▲" : "▼"}</span>
+                </button>
+
+                {showToolPicker && (
+                  <div className="tool-picker">
+                    <div className="tool-picker-header">
+                      <span>Select tools to use</span>
+                      <div className="tp-actions">
+                        <button className="tp-btn" onClick={selectAllTools}>All</button>
+                        <button className="tp-btn" onClick={clearTools}>None</button>
+                      </div>
+                    </div>
+                    <div className="tool-picker-grid">
+                      {ALL_TOOLS.map(tool => (
+                        <div
+                          key={tool.id}
+                          className={`tool-option ${selectedTools.includes(tool.id) ? "active" : ""}`}
+                          onClick={() => toggleTool(tool.id)}
+                        >
+                          <div className="tool-option-top">
+                            <span className="tool-option-label">{tool.label}</span>
+                            <span className={`tool-check ${selectedTools.includes(tool.id) ? "checked" : ""}`}>
+                              {selectedTools.includes(tool.id) ? "✓" : ""}
+                            </span>
+                          </div>
+                          <span className="tool-option-desc">{tool.desc}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="tools-strip">
+                {ALL_TOOLS.map(t => (
+                  <span
+                    key={t.id}
+                    className={`tool-chip ${selectedTools.includes(t.id) ? "" : "inactive"}`}
+                  >
+                    {t.label}
+                  </span>
+                ))}
+              </div>
+
+              <div className="suggestions">
+                <p className="suggestions-label">Try these</p>
+                <div className="suggestions-grid">
+                  {suggestions.map(s => (
+                    <button key={s} className="suggestion-btn" onClick={() => startResearch(s)}>
+                      {s} ↗
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="research-view">
+            {/* Steps sidebar */}
+            <div className="steps-col">
+              {/* ✅ NEW CHAT BUTTON */}
+              <button className="new-chat-btn" onClick={startNewChat}>
+                ＋ New Chat
+              </button>
+
+              <div className="steps-header">
+                <span className={`steps-status ${isResearching ? "active" : "done"}`}>
+                  {isResearching ? "● Researching" : "✓ Complete"}
+                </span>
+              </div>
+
+              {/* Show attached file if any */}
+              {uploadedFile && (
+                <div className="sidebar-file-chip">
+                  📄 {uploadedFile.name.slice(0, 25)}{uploadedFile.name.length > 25 ? "..." : ""}
+                </div>
+              )}
+
+              {/* Active tools indicator */}
+              <div className="active-tools-strip">
+                <span className="at-label">Tools:</span>
+                <div className="at-chips">
+                  {ALL_TOOLS.filter(t => selectedTools.includes(t.id)).map(t => (
+                    <span key={t.id} className="at-chip">{t.label}</span>
+                  ))}
+                </div>
+              </div>
+
+              <div className="steps-list">
+                {steps.map((step, i) => (
+                  <div key={i} className={`step-row ${i === steps.length - 1 && isResearching ? "latest" : ""}`}>
+                    <span className="step-bullet">›</span>
+                    <span className="step-txt">{step}</span>
+                  </div>
+                ))}
+                {isResearching && (
+                  <div className="step-row latest">
+                    <span className="step-bullet pulse">●</span>
+                    <span className="step-txt">Working...</span>
+                  </div>
+                )}
+              </div>
+
+              {stats && (
+                <div className="stats-card">
+                  <div className="stat-item">
+                    <span className="stat-label">Searches</span>
+                    <span className="stat-val">{stats.searches}</span>
+                  </div>
+                  <div className="stat-item">
+                    <span className="stat-label">Words</span>
+                    <span className="stat-val">{stats.words}</span>
+                  </div>
+                  {stats.urls !== undefined && (
+                    <div className="stat-item">
+                      <span className="stat-label">URLs</span>
+                      <span className="stat-val green">{stats.urls}</span>
+                    </div>
+                  )}
+                  <div className="stat-item">
+                    <span className="stat-label">Cached</span>
+                    <span className="stat-val green">{stats.cached ? "Yes" : "No"}</span>
+                  </div>
+                </div>
+              )}
+
+              {/* History */}
+              {history.length > 0 && (
+                <div className="history-col">
+                  <p className="history-label">History</p>
+                  {history.map((item, i) => (
+                    <div key={i} className="history-row" onClick={() => {
+                      setReport(item.report);
+                      setStats(item.stats);
+                      setSteps([]);
+                      setCurrentTopic(item.query);
+                    }}>
+                      <span className="history-dot">📄</span>
+                      <div>
+                        <p className="history-q">{item.query.slice(0, 30)}...</p>
+                        <p className="history-t">{item.timestamp}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {report && !isResearching && (
+                <div className="action-btns">
+                  <button className="action-btn pdf" onClick={() => exportPDF()}>📥 PDF</button>
+                  <button
+                    id="add-to-folder-btn"
+                    className="action-btn folder"
+                    onClick={addToPdfFolder}
+                  >
+                    📁 Add to Folder
+                  </button>
+                  <button className="action-btn copy" onClick={copyReport}>📋 Copy</button>
+                </div>
+              )}
+            </div>
+
+            {/* Report */}
+            <div className="report-col" ref={reportRef}>
+              {!report && isResearching && (
+                <div className="loading-state">
+                  <div className="loading-ring" />
+                  <p>Deep research in progress...</p>
+                  <p className="loading-sub">Using {activeToolCount} search tools for comprehensive analysis</p>
+                </div>
+              )}
+              {report && (
+                <div className="report-body">
+                  {renderReport(report)}
+                  {isResearching && <span className="cursor-blink">▋</span>}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Bottom Input Bar */}
+        {(isResearching || report) && (
+          <div className="bottom-input">
+            <div className="bottom-box">
+              {/* ✅ File button in bottom bar */}
+              <button
+                className="bottom-file-btn"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isResearching || isUploading}
+                title="Attach file"
+              >
+                {isUploading ? "⏳" : "📎"}
+              </button>
+
+              <input
+                className="bottom-field"
+                placeholder={uploadedFile ? `📄 ${uploadedFile.name} attached — type your query...` : "New research topic..."}
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && startResearch()}
+                disabled={isResearching}
+              />
+              <button
+                className={`voice-btn-sm ${isListening ? "listening" : ""}`}
+                onClick={toggleVoice}
+                disabled={isResearching}
+                title="Voice input"
+              >
+                {isListening ? "🔴" : "🎙️"}
+              </button>
+              <button
+                className="bottom-btn"
+                onClick={() => startResearch()}
+                disabled={isResearching || !query.trim()}
+              >
+                {isResearching ? "..." : "↗"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}app.js
+
+/* eslint-disable */
+* { margin: 0; padding: 0; box-sizing: border-box; font-family: "Inter", "Segoe UI", system-ui, sans-serif; }
+
+body { background: #0c0c0c; color: #e2e2e2; height: 100vh; overflow: hidden; }
+
+.app { display: flex; height: 100vh; }
+
+/* ── MAIN ── */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #0c0c0c;
+}
+
+/* ── TOPBAR ── */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 28px;
+  border-bottom: 1px solid #1a1a1a;
+  background: #0c0c0c;
+  flex-shrink: 0;
+}
+
+.topbar-logo { display: flex; align-items: center; gap: 8px; }
+.logo-icon { font-size: 20px; color: #7c6af7; }
+.logo-text { font-size: 17px; font-weight: 700; color: #fff; letter-spacing: -0.3px; }
+
+.topbar-right { display: flex; align-items: center; gap: 10px; }
+
+.topbar-badge {
+  font-size: 11px; color: #555; background: #141414;
+  border: 1px solid #222; border-radius: 20px; padding: 4px 12px;
+}
+
+.folder-btn {
+  position: relative;
+  background: #141414;
+  border: 1px solid #222;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 16px;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #888;
+}
+.folder-btn:hover { border-color: #7c6af7; color: #fff; }
+.folder-btn.has-items { border-color: #7c6af740; color: #7c6af7; }
+
+.folder-badge {
+  position: absolute;
+  top: -5px; right: -5px;
+  background: #7c6af7;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  border-radius: 50%;
+  width: 16px; height: 16px;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* ── MODAL ── */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.7);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(4px);
+}
+
+.modal-box {
+  background: #111;
+  border: 1px solid #222;
+  border-radius: 16px;
+  width: 520px;
+  max-width: 95vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid #1e1e1e;
+  font-size: 15px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.modal-close {
+  background: none; border: none; color: #555;
+  font-size: 16px; cursor: pointer; padding: 2px 6px;
+  border-radius: 4px; transition: color 0.2s;
+}
+.modal-close:hover { color: #fff; }
+
+.modal-empty {
+  padding: 40px 20px;
+  text-align: center;
+  color: #555;
+}
+.modal-empty-sub { font-size: 12px; color: #333; margin-top: 6px; }
+
+.folder-items {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.folder-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #141414;
+  border: 1px solid #1e1e1e;
+  border-radius: 10px;
+  padding: 12px 14px;
+  gap: 12px;
+  transition: border-color 0.2s;
+}
+.folder-item:hover { border-color: #2a2a2a; }
+
+.folder-item-info { flex: 1; min-width: 0; }
+.folder-item-topic { display: block; font-size: 13px; color: #e2e2e2; font-weight: 500; margin-bottom: 3px; }
+.folder-item-meta { font-size: 11px; color: #444; }
+
+.folder-item-actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+.fi-btn {
+  border: none;
+  border-radius: 6px;
+  width: 30px; height: 30px;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.15s;
+}
+.fi-btn.download { background: #7c6af720; color: #7c6af7; border: 1px solid #7c6af730; }
+.fi-btn.download:hover { background: #7c6af740; }
+.fi-btn.remove { background: #ef444420; color: #ef4444; border: 1px solid #ef444430; }
+.fi-btn.remove:hover { background: #ef444440; }
+
+.modal-footer {
+  padding: 12px 20px;
+  border-top: 1px solid #1e1e1e;
+}
+
+.modal-export-all {
+  width: 100%;
+  background: #7c6af720;
+  border: 1px solid #7c6af740;
+  color: #7c6af7;
+  border-radius: 10px;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.2s;
+}
+.modal-export-all:hover { background: #7c6af730; }
+
+/* ── HERO ── */
+.hero {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 40px 20px;
+}
+
+.hero-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  width: 100%;
+  max-width: 700px;
+}
+
+.hero-icon { font-size: 44px; color: #7c6af7; }
+.hero-title { font-size: 32px; font-weight: 700; color: #fff; text-align: center; letter-spacing: -0.5px; }
+.hero-sub { font-size: 15px; color: #555; text-align: center; }
+
+.main-search {
+  display: flex;
+  width: 100%;
+  background: #141414;
+  border: 1px solid #2a2a2a;
+  border-radius: 16px;
+  padding: 6px 6px 6px 18px;
+  gap: 8px;
+  transition: border-color 0.2s;
+  margin-top: 8px;
+  align-items: center;
+}
+
+.main-search:focus-within { border-color: #7c6af7; }
+
+.main-input {
+  flex: 1;
+  background: none;
+  border: none;
+  color: #e2e2e2;
+  font-size: 16px;
+  outline: none;
+  padding: 8px 0;
+}
+
+.main-input::placeholder { color: #444; }
+
+.voice-btn {
+  background: none;
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  width: 40px; height: 40px;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  color: #666;
+}
+.voice-btn:hover { border-color: #7c6af7; background: #7c6af710; }
+.voice-btn.listening {
+  border-color: #ef4444;
+  background: #ef444415;
+  animation: voice-pulse 1.2s infinite;
+}
+
+.voice-btn-sm {
+  background: none;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  padding: 4px 6px;
+  border-radius: 6px;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+.voice-btn-sm:hover { opacity: 1; }
+.voice-btn-sm.listening { opacity: 1; animation: voice-pulse 1.2s infinite; }
+.voice-btn-sm:disabled { opacity: 0.2; cursor: not-allowed; }
+
+@keyframes voice-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.voice-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #ef4444;
+  margin-top: -8px;
+}
+
+.voice-pulse {
+  display: inline-block;
+  width: 8px; height: 8px;
+  background: #ef4444;
+  border-radius: 50%;
+  animation: voice-pulse 1s infinite;
+}
+
+.main-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #7c6af7;
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  padding: 10px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+  white-space: nowrap;
+}
+
+.main-btn:hover { background: #6b5ce7; }
+.btn-arrow { font-size: 16px; }
+
+/* ── FILE UPLOAD ── */
+.file-upload-wrap {
+  width: 100%;
+}
+
+.file-upload-btn {
+  width: 100%;
+  background: #111;
+  border: 1px dashed #2a2a2a;
+  color: #888;
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.2s;
+}
+
+.file-upload-btn:hover {
+  border-color: #7c6af7;
+  color: #c4bfff;
+  background: #7c6af708;
+}
+
+.file-upload-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.file-attached {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #7c6af710;
+  border: 1px solid #7c6af740;
+  border-radius: 10px;
+  padding: 10px 14px;
+  width: 100%;
+}
+
+.file-icon {
+  font-size: 22px;
+  flex-shrink: 0;
+}
+
+.file-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.file-name {
+  font-size: 13px;
+  color: #e2e2e2;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-meta {
+  font-size: 11px;
+  color: #888;
+}
+
+.file-remove {
+  background: none;
+  border: none;
+  color: #ef4444;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+.file-remove:hover {
+  background: #ef444420;
+}
+
+/* Sidebar file chip */
+.sidebar-file-chip {
+  background: #7c6af715;
+  border: 1px solid #7c6af740;
+  color: #c4bfff;
+  font-size: 11px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  word-break: break-all;
+  line-height: 1.4;
+}
+
+/* Bottom file button */
+.bottom-file-btn {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.bottom-file-btn:hover {
+  color: #7c6af7;
+  background: #7c6af715;
+}
+
+.bottom-file-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* ── TOOL SELECTOR ── */
+.tool-selector-wrap {
+  width: 100%;
+  position: relative;
+}
+
+.tool-selector-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #111;
+  border: 1px solid #1e1e1e;
+  border-radius: 10px;
+  padding: 9px 14px;
+  font-size: 13px;
+  color: #888;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.2s;
+  width: 100%;
+  justify-content: space-between;
+}
+.tool-selector-toggle:hover { border-color: #7c6af760; color: #c4bfff; }
+
+.ts-arrow { font-size: 10px; color: #555; }
+
+.tool-picker {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0; right: 0;
+  background: #111;
+  border: 1px solid #222;
+  border-radius: 12px;
+  padding: 14px;
+  z-index: 100;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+}
+
+.tool-picker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: #555;
+}
+
+.tp-actions { display: flex; gap: 6px; }
+.tp-btn {
+  background: #1a1a1a;
+  border: 1px solid #222;
+  color: #888;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+}
+.tp-btn:hover { color: #fff; border-color: #444; }
+
+.tool-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.tool-option {
+  background: #141414;
+  border: 1px solid #1e1e1e;
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  user-select: none;
+}
+.tool-option:hover { border-color: #7c6af760; background: #181818; }
+.tool-option.active { border-color: #7c6af7; background: #7c6af710; }
+
+.tool-option-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.tool-option-label { font-size: 13px; color: #e2e2e2; font-weight: 500; }
+.tool-check {
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  border: 1px solid #333;
+  font-size: 10px;
+  display: flex; align-items: center; justify-content: center;
+  color: #7c6af7; font-weight: 700;
+  transition: all 0.15s;
+}
+.tool-check.checked { background: #7c6af7; color: #fff; border-color: #7c6af7; }
+
+.tool-option-desc { font-size: 10px; color: #555; line-height: 1.3; }
+
+.tools-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+
+.tool-chip {
+  background: #141414;
+  border: 1px solid #222;
+  color: #666;
+  font-size: 12px;
+  padding: 5px 14px;
+  border-radius: 20px;
+  transition: all 0.2s;
+}
+.tool-chip.inactive {
+  opacity: 0.3;
+  text-decoration: line-through;
+}
+
+.suggestions { width: 100%; }
+.suggestions-label { font-size: 12px; color: #444; text-align: center; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
+
+.suggestions-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.suggestion-btn {
+  background: #111;
+  border: 1px solid #1e1e1e;
+  color: #888;
+  border-radius: 12px;
+  padding: 14px 16px;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.2s;
+  line-height: 1.4;
+}
+
+.suggestion-btn:hover { background: #181818; border-color: #7c6af744; color: #c4bfff; }
+
+/* ── RESEARCH VIEW ── */
+.research-view {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ── STEPS COLUMN ── */
+.steps-col {
+  width: 270px;
+  flex-shrink: 0;
+  background: #0f0f0f;
+  border-right: 1px solid #1a1a1a;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 14px;
+  gap: 14px;
+  overflow-y: auto;
+}
+
+.new-chat-btn {
+  background: #7c6af7;
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+}
+.new-chat-btn:hover { background: #6b5ce7; }
+
+.steps-header { padding-bottom: 8px; border-bottom: 1px solid #1a1a1a; }
+
+.steps-status {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 20px;
+}
+
+.steps-status.active { color: #f59e0b; background: #f59e0b15; }
+.steps-status.done { color: #10b981; background: #10b98115; }
+
+.active-tools-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.at-label { font-size: 10px; color: #444; text-transform: uppercase; letter-spacing: 1px; }
+.at-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.at-chip {
+  font-size: 10px;
+  background: #141414;
+  border: 1px solid #1e1e1e;
+  color: #666;
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+.steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 0;
+}
+
+.step-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+
+.step-row.latest { background: #141414; }
+
+.step-bullet { color: #7c6af7; font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+.step-bullet.pulse { animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.2; } }
+
+.step-txt { font-size: 12px; color: #777; line-height: 1.5; }
+
+.stats-card {
+  background: #141414;
+  border: 1px solid #1e1e1e;
+  border-radius: 10px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.stat-item { display: flex; justify-content: space-between; align-items: center; }
+.stat-label { font-size: 12px; color: #555; }
+.stat-val { font-size: 13px; font-weight: 600; color: #e2e2e2; }
+.stat-val.green { color: #10b981; }
+
+.history-col { display: flex; flex-direction: column; gap: 4px; }
+.history-label { font-size: 10px; color: #444; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+
+.history-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.history-row:hover { background: #141414; }
+.history-dot { font-size: 13px; flex-shrink: 0; margin-top: 1px; }
+.history-q { font-size: 12px; color: #aaa; line-height: 1.4; }
+.history-t { font-size: 10px; color: #444; margin-top: 2px; }
+
+.action-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.action-btn {
+  flex: 1;
+  border: none;
+  border-radius: 8px;
+  padding: 9px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: opacity 0.2s;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.action-btn:hover { opacity: 0.85; }
+.action-btn.pdf    { background: #7c6af720; color: #7c6af7; border: 1px solid #7c6af740; }
+.action-btn.folder { background: #f59e0b20; color: #f59e0b; border: 1px solid #f59e0b40; }
+.action-btn.copy   { background: #10b98120; color: #10b981; border: 1px solid #10b98140; }
+
+/* ── REPORT COLUMN ── */
+.report-col {
+  flex: 1;
+  overflow-y: auto;
+  padding: 36px 52px;
+}
+
+.report-body {
+  max-width: 820px;
+  margin: 0 auto;
+  line-height: 1.85;
+}
+
+.r-h1 { font-size: 26px; font-weight: 700; color: #fff; margin: 28px 0 14px; letter-spacing: -0.3px; }
+.r-h2 {
+  font-size: 19px; font-weight: 600; color: #e2e2e2;
+  margin: 24px 0 10px; padding-bottom: 8px;
+  border-bottom: 1px solid #1e1e1e;
+}
+.r-h3 { font-size: 15px; font-weight: 600; color: #7c6af7; margin: 18px 0 8px; }
+.r-p { font-size: 15px; color: #b0b0b0; margin: 6px 0; line-height: 1.85; }
+.r-li { font-size: 15px; color: #b0b0b0; margin: 5px 0 5px 16px; line-height: 1.75; }
+.r-link { color: #7c6af7; text-decoration: none; word-break: break-all; }
+.r-link:hover { text-decoration: underline; }
+
+.cursor-blink {
+  display: inline-block;
+  animation: blink 0.8s infinite;
+  color: #7c6af7;
+  font-size: 18px;
+  margin-left: 2px;
+}
+@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0; } }
+
+.loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 60vh;
+  gap: 16px;
+  color: #444;
+}
+
+.loading-ring {
+  width: 44px; height: 44px;
+  border: 3px solid #1e1e1e;
+  border-top-color: #7c6af7;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-sub { font-size: 13px; color: #333; }
+
+/* ── BOTTOM INPUT ── */
+.bottom-input {
+  padding: 14px 28px 20px;
+  background: #0c0c0c;
+  border-top: 1px solid #141414;
+  flex-shrink: 0;
+}
+
+.bottom-box {
+  display: flex;
+  align-items: center;
+  background: #111;
+  border: 1px solid #222;
+  border-radius: 14px;
+  padding: 8px 8px 8px 18px;
+  gap: 8px;
+  max-width: 860px;
+  margin: 0 auto;
+  transition: border-color 0.2s;
+}
+
+.bottom-box:focus-within { border-color: #7c6af7; }
+
+.bottom-field {
+  flex: 1;
+  background: none;
+  border: none;
+  color: #e2e2e2;
+  font-size: 15px;
+  outline: none;
+  font-family: inherit;
+}
+
+.bottom-field::placeholder { color: #444; }
+.bottom-field:disabled { opacity: 0.5; }
+
+.bottom-btn {
+  background: #7c6af7;
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  width: 38px; height: 38px;
+  font-size: 18px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.bottom-btn:hover { background: #6b5ce7; }
+.bottom-btn:disabled { background: #1e1e1e; color: #444; cursor: not-allowed; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #222; border-radius: 2px; }app.css
